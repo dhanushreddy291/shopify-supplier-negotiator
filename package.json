@@ -1,0 +1,33 @@
+{
+  "name": "shopify-supplier-negotiator",
+  "version": "1.0.0",
+  "description": "An autonomous Shopify procurement agent built on Trigger.dev, Resend, Postgres, and the Vercel AI SDK.",
+  "scripts": {
+    "dev": "trigger dev",
+    "deploy": "trigger deploy",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "tsx --env-file-if-exists=.env.local src/db/migrate.ts",
+    "demo:stockout": "npx trigger.dev tasks trigger simulate-inventory-low --payload '{\"sku\":\"ESP-GASKET-58\"}'",
+    "test": "node --import tsx --test src/lib/*.test.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@ai-sdk/openai": "^4.0.122",
+    "@ai-sdk/otel": "^1.0.178",
+    "@trigger.dev/sdk": "^4.8.8",
+    "ai": "^7.0.178",
+    "pg": "^8.23.1",
+    "resend": "^6.39.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@trigger.dev/build": "^4.8.8",
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "trigger.dev": "^4.8.8",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}
