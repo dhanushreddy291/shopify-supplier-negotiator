@@ -1,12 +1,52 @@
 import { logger, task, wait } from "@trigger.dev/sdk";
-import { findOpenEmailThread, markEmailThreadCompleted } from "../lib/db";
 import {
   bareAddress,
   fetchInboundEmail,
+  recipientTag,
   stripQuotedReply,
+  threadTag,
   type InboundEmail,
 } from "../lib/email";
 import type { InboundReply } from "../lib/types";
+
+async function findWaitingToken(input: {
+  threadId?: string;
+  sender: string;
+  tokenId?: string;
+}): Promise<{ id: string; tags: string[] } | undefined> {
+  if (input.tokenId) {
+    const token = await wait.retrieveToken(input.tokenId);
+    if (token.status === "WAITING") {
+      return { id: token.id, tags: token.tags };
+    }
+    return undefined;
+  }
+
+  if (input.threadId) {
+    for await (const token of wait.listTokens({
+      status: "WAITING",
+      tags: [threadTag(input.threadId)],
+    })) {
+      return { id: token.id, tags: token.tags };
+    }
+  }
+
+  for await (const token of wait.listTokens({
+    status: "WAITING",
+    tags: [recipientTag(input.sender)],
+  })) {
+    if (!token.tags.some((t) => t.startsWith("thread:"))) {
+      return { id: token.id, tags: token.tags };
+    }
+  }
+
+  return undefined;
+}
+
+function tagValue(tags: string[], prefix: string): string | undefined {
+  const match = tags.find((t) => t.startsWith(`${prefix}:`));
+  return match ? match.slice(prefix.length + 1) : undefined;
+}
 
 export const ingestInboundEmailTask = task({
   id: "ingest-inbound-email",
@@ -29,9 +69,17 @@ export const ingestInboundEmailTask = task({
       email.text?.trim() || (email.html ? email.html.replace(/<[^>]+>/g, " ").trim() : "");
     const text = stripQuotedReply(rawBody);
 
-    const thread = await findOpenEmailThread(sender, payload.tokenId);
-    if (!thread) {
-      logger.warn("Ignoring inbound email with no open waitpoint", { sender, emailId: email.id });
+    const token = await findWaitingToken({
+      threadId: payload.threadId,
+      sender,
+      tokenId: payload.tokenId,
+    });
+    if (!token) {
+      logger.warn("Ignoring inbound email with no open waitpoint", {
+        threadId: payload.threadId,
+        sender,
+        emailId: email.id,
+      });
       return { status: "ignored" as const, reason: "no-open-request" };
     }
 
@@ -42,27 +90,34 @@ export const ingestInboundEmailTask = task({
     const reply: InboundReply = {
       emailId: email.id,
       inboxId: payload.mockEmail ? undefined : payload.inboxId,
-      threadId: payload.mockEmail ? undefined : payload.threadId,
+      threadId: payload.threadId,
       from: sender,
       subject,
       text,
     };
 
-    await wait.completeToken<InboundReply>(thread.tokenId, reply);
-    await markEmailThreadCompleted(thread.tokenId);
+    await wait.completeToken<InboundReply>(token.id, reply);
+
+    const caseId = tagValue(token.tags, "case");
+    const kind = tagValue(token.tags, "kind") as "rfq" | "approval" | undefined;
+    const supplierId = tagValue(token.tags, "supplier");
+    const round = tagValue(token.tags, "round");
 
     logger.info("Completed email waitpoint", {
-      caseId: thread.caseId,
-      kind: thread.kind,
-      supplierId: thread.supplierId,
-      round: thread.round,
+      tokenId: token.id,
+      threadId: payload.threadId,
+      caseId,
+      kind,
+      supplierId,
+      round,
     });
 
     return {
       status: "completed" as const,
-      kind: thread.kind,
-      caseId: thread.caseId,
-      tokenId: thread.tokenId,
+      kind,
+      caseId,
+      threadId: payload.threadId,
+      tokenId: token.id,
     };
   },
 });

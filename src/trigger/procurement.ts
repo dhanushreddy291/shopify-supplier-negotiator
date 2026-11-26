@@ -1,8 +1,13 @@
 import { logger, metadata, task, tasks, wait } from "@trigger.dev/sdk";
 import { classifyOwnerReply, recommendSupplier } from "../lib/agent";
 import { findProduct, suppliersForProduct } from "../lib/catalog";
-import { newPurchaseOrderNumber, saveCase, saveEmailThread } from "../lib/db";
-import { isMockMode, sendEmail } from "../lib/email";
+import {
+  isMockMode,
+  newPurchaseOrderNumber,
+  recipientTag,
+  sendEmail,
+  threadTag,
+} from "../lib/email";
 import { modelCallLimit } from "../lib/limits";
 import { formatApprovalEmail, formatPurchaseOrderEmail } from "../lib/templates";
 import type {
@@ -19,12 +24,23 @@ const STORE_NAME = process.env.STORE_NAME || "Acme Coffee Works";
 const STORE_ADDRESS = process.env.STORE_ADDRESS || "1450 Valencia St, San Francisco, CA 94110";
 const OWNER_EMAIL = process.env.OWNER_EMAIL || "owner@example.com";
 
-type ProcurementPayload = {
+export type ProcurementPayload = {
   caseId: string;
   shopDomain: string;
   inventory: InventorySnapshot;
   orderQuantity: number;
 };
+
+function trackCase(record: ProcurementCase): ProcurementCase {
+  const next: ProcurementCase = { ...record, updatedAt: new Date().toISOString() };
+  metadata
+    .set("caseId", next.id)
+    .set("sku", next.sku)
+    .set("orderQuantity", next.orderQuantity)
+    .set("status", next.status)
+    .set("case", next);
+  return next;
+}
 
 export const procurementCaseTask = task({
   id: "procurement-case",
@@ -33,7 +49,7 @@ export const procurementCaseTask = task({
     const { caseId, shopDomain, inventory, orderQuantity } = payload;
     const now = new Date().toISOString();
 
-    let record: ProcurementCase = await saveCase({
+    let record: ProcurementCase = trackCase({
       id: caseId,
       shopDomain,
       sku: inventory.sku,
@@ -45,20 +61,16 @@ export const procurementCaseTask = task({
       createdAt: now,
       updatedAt: now,
     });
-    metadata
-      .set("caseId", caseId)
-      .set("sku", inventory.sku)
-      .set("orderQuantity", orderQuantity)
-      .set("status", "negotiating");
 
+    // 1. Load the SKU's supplier panel from the catalog.
     const product = findProduct(inventory.sku);
     const panel = product ? suppliersForProduct(product) : [];
     if (!product || panel.length === 0) {
-      await saveCase({ ...record, status: "no_quotes" });
-      metadata.set("status", "no_quotes");
-      return { caseId, status: "no_quotes" as const };
+      record = trackCase({ ...record, status: "no_quotes" });
+      return { caseId, status: "no_quotes" as const, case: record };
     }
 
+    // 2. Negotiate with each supplier in parallel via durable child tasks.
     const batch = await negotiateWithSupplierTask.batchTriggerAndWait(
       panel.map((supplier) => ({
         payload: { caseId, supplier, product, orderQuantity },
@@ -72,10 +84,11 @@ export const procurementCaseTask = task({
     );
 
     if (quotes.length === 0) {
-      await saveCase({ ...record, status: "no_quotes", quotes });
-      return { caseId, status: "no_quotes" as const };
+      record = trackCase({ ...record, status: "no_quotes", quotes });
+      return { caseId, status: "no_quotes" as const, case: record };
     }
 
+    // 3. AI recommendation -> pause for owner approval by email.
     const recommendation = await recommendSupplier({
       sku: inventory.sku,
       quantity: orderQuantity,
@@ -83,52 +96,58 @@ export const procurementCaseTask = task({
     });
 
     if (!recommendation) {
-      await saveCase({ ...record, status: "no_quotes", quotes });
-      return { caseId, status: "no_quotes" as const };
+      record = trackCase({ ...record, status: "no_quotes", quotes });
+      return { caseId, status: "no_quotes" as const, case: record };
     }
 
-    record = await saveCase({
+    record = trackCase({
       ...record,
       status: "awaiting_approval",
       quotes,
       recommendation,
     });
-    metadata.set("status", "awaiting_approval").set("recommended", recommendation.supplierName);
+    metadata.set("recommended", recommendation.supplierName);
 
     const approvalSubject = `Approve purchase order: ${recommendation.quantity} × ${inventory.productTitle}`;
 
-    const approvalToken = await wait.createToken({
-      timeout: isMockMode() ? "10m" : "7d",
-      idempotencyKey: `approval:${caseId}`,
-      tags: ["procurement", "approval", `case:${caseId}`],
-    });
-
-    await saveEmailThread({
-      tokenId: approvalToken.id,
-      kind: "approval",
-      caseId,
-      supplierId: recommendation.supplierId,
-      round: 1,
-      toEmail: OWNER_EMAIL,
-      subject: approvalSubject,
-    });
-
-    await sendEmail({
+    const approvalSent = await sendEmail({
       to: OWNER_EMAIL,
       subject: approvalSubject,
       text: formatApprovalEmail({ inventory, recommendation, quotes }),
       idempotencyKey: `approval-email:${caseId}`,
     });
 
+    const approvalToken = await wait.createToken({
+      timeout: isMockMode() ? "10m" : "7d",
+      idempotencyKey: `approval:${caseId}`,
+      tags: [
+        "procurement",
+        "kind:approval",
+        `case:${caseId}`,
+        `supplier:${recommendation.supplierId}`,
+        "round:1",
+        recipientTag(OWNER_EMAIL),
+        ...(approvalSent.threadId ? [threadTag(approvalSent.threadId)] : []),
+      ],
+    });
+
     if (isMockMode()) {
       await tasks.trigger(
         "simulate-owner-reply",
-        { tokenId: approvalToken.id, subject: approvalSubject },
+        {
+          tokenId: approvalToken.id,
+          threadId: approvalSent.threadId,
+          subject: approvalSubject,
+        },
         { delay: "3s", idempotencyKey: `sim-owner:${approvalToken.id}` }
       );
     }
 
-    logger.info("Suspended awaiting owner approval", { caseId, approvalSubject });
+    logger.info("Suspended awaiting owner approval", {
+      caseId,
+      threadId: approvalSent.threadId,
+      approvalSubject,
+    });
     const waited = await wait.forToken<InboundReply>(approvalToken.id);
 
     let approval: ApprovalDecision | undefined;
@@ -148,11 +167,11 @@ export const procurementCaseTask = task({
 
     if (!approval || approval.status !== "approved") {
       const status = "rejected" as const;
-      await saveCase({ ...record, status, approval });
-      metadata.set("status", status);
-      return { caseId, status, recommendation };
+      record = trackCase({ ...record, status, approval });
+      return { caseId, status, recommendation, case: record };
     }
 
+    // 4. Place the purchase order (idempotent email + run metadata).
     const winner = panel.find((s) => s.id === recommendation.supplierId)!;
     const placedAt = new Date().toISOString();
     const deliveryDate = new Date(Date.now() + recommendation.leadTimeDays * 86_400_000)
@@ -188,8 +207,8 @@ export const procurementCaseTask = task({
     });
     po.emailId = sent.id;
 
-    await saveCase({ ...record, status: "ordered", approval, purchaseOrder: po });
-    metadata.set("status", "ordered").set("poNumber", po.number);
+    record = trackCase({ ...record, status: "ordered", approval, purchaseOrder: po });
+    metadata.set("poNumber", po.number);
 
     await sendEmail({
       to: OWNER_EMAIL,
@@ -199,6 +218,6 @@ export const procurementCaseTask = task({
     });
 
     logger.info("Purchase order placed", { caseId, poNumber: po.number, total: po.total });
-    return { caseId, status: "ordered" as const, purchaseOrder: po };
+    return { caseId, status: "ordered" as const, purchaseOrder: po, case: record };
   },
 });

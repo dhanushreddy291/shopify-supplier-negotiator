@@ -1,6 +1,6 @@
 import { idempotencyKeys, logger, metadata, task } from "@trigger.dev/sdk";
 import { findProduct } from "../lib/catalog";
-import { newCaseId } from "../lib/db";
+import { newCaseId } from "../lib/email";
 import { shopifyApiLimit } from "../lib/limits";
 import { enrichInventoryLevel } from "../lib/shopify";
 import { procurementCaseTask } from "./procurement";

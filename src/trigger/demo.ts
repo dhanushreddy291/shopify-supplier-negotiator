@@ -40,6 +40,7 @@ export const simulateSupplierReplyTask = task({
   id: "simulate-supplier-reply",
   run: async (payload: {
     tokenId: string;
+    threadId?: string;
     supplierId: string;
     sku: string;
     round: number;
@@ -76,9 +77,9 @@ export const simulateSupplierReplyTask = task({
 
     const handle = await ingestInboundEmailTask.trigger({
       inboxId: "mock-inbox",
-      threadId: `mock_${payload.tokenId}`,
+      threadId: payload.threadId ?? `mock_${payload.tokenId}`,
       emailId: mockEmail.id,
-      tokenId: payload.tokenId,
+      tokenId: payload.threadId ? undefined : payload.tokenId,
       mockEmail,
     });
 
@@ -88,7 +89,12 @@ export const simulateSupplierReplyTask = task({
 
 export const simulateOwnerReplyTask = task({
   id: "simulate-owner-reply",
-  run: async (payload: { tokenId: string; subject?: string; replyText?: string }) => {
+  run: async (payload: {
+    tokenId: string;
+    threadId?: string;
+    subject?: string;
+    replyText?: string;
+  }) => {
     const text = payload.replyText ?? "Approved. Please ask them to ship before Friday.";
     const mockEmail: InboundEmail = {
       id: `sim_owner_${payload.tokenId}`,
@@ -104,9 +110,9 @@ export const simulateOwnerReplyTask = task({
     const result = await ingestInboundEmailTask
       .triggerAndWait({
         inboxId: "mock-inbox",
-        threadId: `mock_${payload.tokenId}`,
+        threadId: payload.threadId ?? `mock_${payload.tokenId}`,
         emailId: mockEmail.id,
-        tokenId: payload.tokenId,
+        tokenId: payload.threadId ? undefined : payload.tokenId,
         mockEmail,
       })
       .unwrap();

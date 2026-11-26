@@ -1,7 +1,6 @@
-import { logger, task, tasks, wait } from "@trigger.dev/sdk";
+import { logger, metadata, task, tasks, wait } from "@trigger.dev/sdk";
 import { runNegotiationAgent, type SupplierEmailOutcome } from "../lib/agent";
-import { saveEmailThread } from "../lib/db";
-import { isMockMode, sendEmail } from "../lib/email";
+import { isMockMode, recipientTag, sendEmail, threadTag } from "../lib/email";
 import { modelCallLimit } from "../lib/limits";
 import {
   formatCounterofferEmail,
@@ -19,7 +18,7 @@ const STORE_NAME = process.env.STORE_NAME || "Acme Coffee Works";
 const MAX_NEGOTIATION_ROUNDS = 2;
 const REPLY_TIMEOUT = "48h";
 
-type SupplierNegotiationResult = {
+export type SupplierNegotiationResult = {
   supplierId: string;
   supplierName: string;
   status: "quoted" | "no_response" | "declined";
@@ -40,30 +39,22 @@ export const negotiateWithSupplierTask = task({
     let round = 0;
     let lastReply: InboundReply | undefined;
 
+    metadata
+      .set("caseId", caseId)
+      .set("supplierId", supplier.id)
+      .set("supplierName", supplier.name)
+      .set("sku", product.sku);
+
     async function sendAndWait(text: string): Promise<SupplierEmailOutcome> {
       round += 1;
+      metadata.set("round", round);
+
       const subject =
         round === 1
           ? `Quote request: ${orderQuantity} × ${product.title}`
           : `Re: Quote request: ${orderQuantity} × ${product.title}`;
 
-      const token = await wait.createToken({
-        timeout: isMockMode() ? "5m" : REPLY_TIMEOUT,
-        idempotencyKey: `rfq:${caseId}:${supplier.id}:${round}`,
-        tags: ["procurement", `case:${caseId}`, `supplier:${supplier.id}`, `round:${round}`],
-      });
-
-      await saveEmailThread({
-        tokenId: token.id,
-        kind: "rfq",
-        caseId,
-        supplierId: supplier.id,
-        round,
-        toEmail: supplier.email,
-        subject,
-      });
-
-      await sendEmail({
+      const sent = await sendEmail({
         to: supplier.email,
         subject,
         text: text.trim(),
@@ -78,10 +69,33 @@ export const negotiateWithSupplierTask = task({
             : undefined,
       });
 
+      const threadId = sent.threadId ?? lastReply?.threadId;
+
+      const token = await wait.createToken({
+        timeout: isMockMode() ? "5m" : REPLY_TIMEOUT,
+        idempotencyKey: `rfq:${caseId}:${supplier.id}:${round}`,
+        tags: [
+          "procurement",
+          "kind:rfq",
+          `case:${caseId}`,
+          `supplier:${supplier.id}`,
+          `round:${round}`,
+          recipientTag(supplier.email),
+          ...(threadId ? [threadTag(threadId)] : []),
+        ],
+      });
+
       if (isMockMode()) {
         await tasks.trigger(
           "simulate-supplier-reply",
-          { tokenId: token.id, supplierId: supplier.id, sku: product.sku, round, subject },
+          {
+            tokenId: token.id,
+            threadId,
+            supplierId: supplier.id,
+            sku: product.sku,
+            round,
+            subject,
+          },
           { delay: "3s", idempotencyKey: `sim-reply:${token.id}` }
         );
       }
@@ -95,7 +109,7 @@ export const negotiateWithSupplierTask = task({
       lastReply = waited.output;
       return { timedOut: false, round, replyText: waited.output.text };
     }
-
+    
     const initial = await sendAndWait(
       formatRfqEmail({
         supplierName: supplier.name,

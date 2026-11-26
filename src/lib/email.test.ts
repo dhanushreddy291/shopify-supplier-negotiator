@@ -4,8 +4,12 @@ import {
   bareAddress,
   getEmailMode,
   isMockMode,
+  newCaseId,
+  newPurchaseOrderNumber,
+  recipientTag,
   sendEmail,
   stripQuotedReply,
+  threadTag,
 } from "./email";
 import {
   formatApprovalEmail,
@@ -30,6 +34,7 @@ test("mock mode logs emails locally and never sends real mail", async () => {
       idempotencyKey: "rfq-email:case1",
     });
     assert.equal(sent.id, "mock_rfq-email:case1");
+    assert.equal(sent.threadId, "mock_thread_rfq-email:case1");
   } finally {
     if (saved === undefined) delete process.env.EMAIL_MODE;
     else process.env.EMAIL_MODE = saved;
@@ -48,9 +53,14 @@ test("resend mode switches getEmailMode to resend", () => {
   }
 });
 
-test("bareAddress extracts lowercase address from display names", () => {
+test("bareAddress and waitpoint tags normalize display names and thread IDs", () => {
   assert.equal(bareAddress("Harbor Supply <Sales@Harbor.Example>"), "sales@harbor.example");
   assert.equal(bareAddress("owner@example.com"), "owner@example.com");
+  assert.equal(threadTag("thr_123"), "thread:thr_123");
+  assert.equal(recipientTag("Owner <Owner@Example.com>"), "to:owner@example.com");
+  const caseId = newCaseId();
+  assert.match(caseId, /^pc_[0-9a-f]{12}$/);
+  assert.match(newPurchaseOrderNumber(caseId), /^PO-\d{4}-[0-9A-F]{12}$/);
 });
 
 test("stripQuotedReply drops quoted thread history", () => {

@@ -1,7 +1,33 @@
+import { randomBytes } from "node:crypto";
 import { logger } from "@trigger.dev/sdk";
 import { Resend } from "resend";
 
-type EmailMode = "mock" | "resend";
+/**
+ * Resend outbound/inbound email helpers and waitpoint correlation tags.
+ *
+ * EMAIL_MODE controls how outbound email behaves:
+ *   - mock (default): nothing is sent; demo tasks simulate replies after 3s.
+ *   - resend: sends real emails via Resend to supplier addresses in catalog.ts and OWNER_EMAIL.
+ */
+
+export function newCaseId(): string {
+  return `pc_${randomBytes(6).toString("hex")}`;
+}
+
+export function newPurchaseOrderNumber(caseId: string): string {
+  return `PO-${new Date().getUTCFullYear()}-${caseId.replace(/^pc_/, "").toUpperCase()}`;
+}
+
+/** Tag attached to a waitpoint token for Resend `thread_id` correlation. */
+export function threadTag(threadId: string): string {
+  return `thread:${threadId}`;
+}
+
+export function recipientTag(email: string): string {
+  return `to:${bareAddress(email)}`;
+}
+
+export type EmailMode = "mock" | "resend";
 
 export type InboundEmail = {
   id: string;
@@ -14,7 +40,7 @@ export type InboundEmail = {
   received_at: string;
 };
 
-type ReplyThreadRef = {
+export type ReplyThreadRef = {
   inboxId: string;
   threadId: string;
   emailId: string;
@@ -48,16 +74,18 @@ export async function sendEmail(input: {
   text: string;
   idempotencyKey: string;
   replyToThread?: ReplyThreadRef;
-}): Promise<{ id: string }> {
+}): Promise<{ id: string; threadId?: string }> {
   if (isMockMode()) {
     const id = `mock_${input.idempotencyKey}`;
+    const threadId = input.replyToThread?.threadId ?? `mock_thread_${input.idempotencyKey}`;
     logger.info("Mock email (not sent)", {
       id,
+      threadId,
       to: input.to,
       subject: input.subject,
       preview: input.text.slice(0, 300),
     });
-    return { id };
+    return { id, threadId };
   }
 
   const resend = getResend();
@@ -82,7 +110,59 @@ export async function sendEmail(input: {
       to: input.to,
       threadId: input.replyToThread.threadId,
     });
-    return { id: data.id };
+    return { id: data.id, threadId: input.replyToThread.threadId };
+  }
+
+  // When RESEND_INBOX_ID is configured, send new outbound threads through the
+  // Resend Inbox (drafts.create -> drafts.send -> drafts.get) so Resend creates
+  // and returns a `thread_id` that inbound replies will carry in webhook payloads.
+  const inboxId = process.env.RESEND_INBOX_ID?.trim();
+  if (inboxId) {
+    const { data: created, error: createError } = await resend.inboxes.drafts.create(
+      {
+        inboxId,
+        to: [input.to],
+        subject: input.subject,
+        text: input.text,
+      },
+      { idempotencyKey: `${input.idempotencyKey}:draft` }
+    );
+
+    if (createError || !created) {
+      throw new Error(`Failed to create inbox draft: ${createError?.message ?? "no data"}`);
+    }
+
+    const { data: sent, error: sendError } = await resend.inboxes.drafts.send(
+      { inboxId, draftId: created.id },
+      { idempotencyKey: input.idempotencyKey }
+    );
+
+    if (sendError && sendError.statusCode !== 409) {
+      throw new Error(`Failed to send inbox draft: ${sendError.message}`);
+    }
+
+    const { data: draft, error: getError } = await resend.inboxes.drafts.get({
+      inboxId,
+      draftId: created.id,
+    });
+
+    if (getError) {
+      logger.warn("Sent inbox draft but failed to read back thread_id", {
+        draftId: created.id,
+        error: getError.message,
+      });
+    }
+
+    const emailId = sent?.id ?? draft?.email_id ?? created.id;
+    const threadId = draft?.thread_id ?? undefined;
+
+    logger.info("Email sent via Resend Inbox", {
+      id: emailId,
+      threadId,
+      to: input.to,
+      subject: input.subject,
+    });
+    return { id: emailId, threadId };
   }
 
   const { data, error } = await resend.emails.send(
